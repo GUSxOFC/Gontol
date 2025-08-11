@@ -1,0 +1,302 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Enkripsi Lokal — Multi Fallback (PIN: 55555)</title>
+<style>
+  body{font-family:system-ui,Arial;background:#071323;color:#e6eef8;padding:18px}
+  .card{max-width:920px;margin:auto;background:#081726;padding:18px;border-radius:10px;box-shadow:0 6px 20px rgba(0,0,0,.6)}
+  input,button,select{font-size:15px;padding:8px;border-radius:6px;border:1px solid #123;background:#061424;color:#e6eef8}
+  button.primary{background:#0ea5a0;color:#012;padding:10px 12px;font-weight:700;border:none}
+  .list{margin-top:12px;background:#061424;padding:10px;border-radius:8px;max-height:300px;overflow:auto;font-family:monospace}
+  .file-item{display:flex;align-items:center;gap:8px;padding:6px;border-bottom:1px dashed #072233}
+  small{color:#9fb3c8}
+  .warn{background:#2b0b0b;color:#ffd6d6;padding:8px;border-radius:6px;margin-top:10px}
+  .hidden{display:none}
+</style>
+</head>
+<body>
+  <div class="card">
+    <h2>Enkripsi Lokal — Multi Fallback</h2>
+    <p>PIN default: <strong>55555</strong>. Pilih folder atau file, centang file yang ingin dienkripsi, lalu tekan Encrypt. Jika ada error baca log di bawah.</p>
+
+    <div style="display:flex;gap:8px;flex-wrap:wrap">
+      <button id="btnDir" class="primary">Izinkan (Pilih Folder)</button>
+      <button id="btnChooseDir">Pilih Folder (webkitdirectory fallback)</button>
+      <button id="btnChooseFiles">Pilih File Manual</button>
+      <input id="pin" type="password" value="55555" style="width:160px" />
+    </div>
+
+    <div class="warn" id="hint">
+      Pastikan membuka halaman via <strong>HTTPS</strong> atau <strong>http://localhost</strong>. Jika membuka melalui <code>file://</code>, <em>showDirectoryPicker()</em> sering gagal.
+    </div>
+
+    <div id="controls" class="hidden" style="margin-top:12px">
+      <div style="margin-bottom:8px">
+        <button id="encryptBtn">🔒 Enkripsi file terpilih</button>
+        <button id="decryptBtn">🔓 Dekripsi .enc terpilih</button>
+        <button id="refreshBtn">↻ Refresh daftar</button>
+      </div>
+      <div class="list" id="fileList"></div>
+    </div>
+
+    <div id="fallbackFiles" class="hidden" style="margin-top:12px">
+      <label>Pilih file (multiple)</label>
+      <input id="fileInput" type="file" multiple />
+      <div style="margin-top:8px">
+        <button id="encryptFallback">🔒 Encrypt (fallback)</button>
+        <button id="decryptFallback">🔓 Decrypt (fallback)</button>
+      </div>
+    </div>
+
+    <div class="list" id="log" style="margin-top:12px;white-space:pre-wrap"></div>
+  </div>
+
+<script>
+/* Helpers log & base64 */
+const logEl = document.getElementById('log');
+function log(s){ logEl.textContent += s + "\\n"; logEl.scrollTop = logEl.scrollHeight; }
+function bufToBase64(b){ return btoa(String.fromCharCode.apply(null,new Uint8Array(b))); }
+function base64ToBuf(b64){ const s=atob(b64); const u=new Uint8Array(s.length); for(let i=0;i<s.length;i++)u[i]=s.charCodeAt(i); return u.buffer; }
+
+/* Crypto key derivation */
+async function deriveKey(pin, salt){
+  const enc = new TextEncoder();
+  const base = await crypto.subtle.importKey('raw', enc.encode(pin), {name:'PBKDF2'}, false, ['deriveKey']);
+  return crypto.subtle.deriveKey({name:'PBKDF2', salt, iterations:200000, hash:'SHA-256'}, base, {name:'AES-GCM', length:256}, false, ['encrypt','decrypt']);
+}
+
+/* Encrypt & decrypt */
+async function encryptBuffer(name, type, buffer, pin){
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveKey(pin, salt);
+  const cipher = await crypto.subtle.encrypt({name:'AES-GCM', iv}, key, buffer);
+  const obj = { name, type: type||'application/octet-stream', salt: bufToBase64(salt), iv: bufToBase64(iv), data: bufToBase64(cipher) };
+  return new Blob([JSON.stringify(obj)], {type:'application/json'});
+}
+async function decryptBlobToFile(blob, pin){
+  const txt = await blob.text();
+  let obj;
+  try { obj = JSON.parse(txt); } catch(e){ throw new Error('Format .enc tidak valid'); }
+  const salt = base64ToBuf(obj.salt), iv = base64ToBuf(obj.iv), data = base64ToBuf(obj.data);
+  const key = await deriveKey(pin, salt);
+  let plain;
+  try { plain = await crypto.subtle.decrypt({name:'AES-GCM', iv:new Uint8Array(iv)}, key, data); }
+  catch(e){ throw new Error('Gagal dekripsi — PIN salah atau data korup'); }
+  return new File([plain], obj.name, {type: obj.type});
+}
+
+/* Download helper */
+function downloadBlob(blob, filename){
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a'); a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url),5000);
+}
+
+/* File System Access (dir) */
+let dirHandle = null;
+const fileListEl = document.getElementById('fileList');
+const controls = document.getElementById('controls');
+const fallbackFiles = document.getElementById('fallbackFiles');
+
+/* Try showDirectoryPicker */
+document.getElementById('btnDir').addEventListener('click', async ()=>{
+  if (!('showDirectoryPicker' in window)) { log('showDirectoryPicker tidak tersedia di browser ini'); return; }
+  try {
+    dirHandle = await window.showDirectoryPicker();
+    log('Folder dipilih: ' + (dirHandle.name || 'unknown'));
+    controls.classList.remove('hidden');
+    fallbackFiles.classList.add('hidden');
+    await listDir();
+  } catch (e){
+    log('Gagal memilih folder: ' + e.message);
+  }
+});
+
+/* webkitdirectory fallback: create an invisible input[type=file] with directory selection */
+document.getElementById('btnChooseDir').addEventListener('click', async ()=>{
+  // create input dynamically to request directory (webkitdirectory)
+  const inp = document.createElement('input');
+  inp.type = 'file';
+  inp.multiple = true;
+  inp.webkitdirectory = true;
+  inp.directory = true;
+  inp.style.display = 'none';
+  document.body.appendChild(inp);
+  inp.addEventListener('change', async (ev)=>{
+    const files = Array.from(inp.files || []);
+    if (files.length===0){ log('Tidak ada file dipilih via webkitdirectory'); document.body.removeChild(inp); return; }
+    // render files as checklist
+    renderFilesListFromArray(files);
+    controls.classList.remove('hidden');
+    fallbackFiles.classList.add('hidden');
+    document.body.removeChild(inp);
+  });
+  inp.click();
+});
+
+/* manual files button shows fallback multi-file input area */
+document.getElementById('btnChooseFiles').addEventListener('click', ()=>{
+  fallbackFiles.classList.remove('hidden');
+  controls.classList.add('hidden');
+});
+
+/* Render using dirHandle (if FS Access present) */
+async function listDir(){
+  fileListEl.innerHTML = '';
+  if (!dirHandle) return;
+  try {
+    for await (const entry of dirHandle.values()){
+      if (entry.kind === 'file'){
+        const row = document.createElement('div'); row.className = 'file-item';
+        const chk = document.createElement('input'); chk.type='checkbox'; chk.dataset.name = entry.name;
+        const nameSpan = document.createElement('span'); nameSpan.textContent = entry.name;
+        row.appendChild(chk); row.appendChild(nameSpan);
+        fileListEl.appendChild(row);
+      }
+    }
+  } catch(e){ log('Error membaca folder: ' + e.message); }
+}
+
+/* Render file list from array (webkitdirectory fallback) */
+let fallbackFileArray = [];
+function renderFilesListFromArray(files){
+  fallbackFileArray = files;
+  fileListEl.innerHTML = '';
+  for (const f of files){
+    const row = document.createElement('div'); row.className = 'file-item';
+    const chk = document.createElement('input'); chk.type='checkbox';
+    chk.dataset.name = f.name;
+    const span = document.createElement('span'); span.textContent = f.webkitRelativePath ? f.webkitRelativePath : f.name;
+    row.appendChild(chk); row.appendChild(span);
+    fileListEl.appendChild(row);
+  }
+}
+
+/* Encrypt selected (works both directory handle and fallback files) */
+document.getElementById('encryptBtn').addEventListener('click', async ()=>{
+  const pin = document.getElementById('pin').value || '';
+  if (!dirHandle && fallbackFileArray.length===0){ alert('Pilih folder atau file terlebih dahulu'); return; }
+  const checks = Array.from(fileListEl.querySelectorAll('input[type=checkbox]:checked'));
+  if (checks.length===0){ alert('Centang file yang ingin dienkripsi'); return; }
+  if (dirHandle){
+    for (const c of checks){
+      const name = c.dataset.name;
+      try {
+        log('🔒 Membaca: ' + name);
+        const fh = await dirHandle.getFileHandle(name);
+        const file = await fh.getFile();
+        const blobEnc = await encryptBuffer(file.name, file.type, await file.arrayBuffer(), pin);
+        // try write to same dir
+        try {
+          const outHandle = await dirHandle.getFileHandle(name + '.enc', {create:true});
+          const writable = await outHandle.createWritable();
+          await writable.write(await blobEnc.arrayBuffer());
+          await writable.close();
+          log('✅ Ditulis di folder: ' + name + '.enc');
+        } catch(e){
+          downloadBlob(blobEnc, name + '.enc');
+          log('ℹ Tidak bisa tulis ke folder — diunduh: ' + name + '.enc');
+        }
+      } catch(e){ log('❌ Error encrypt ' + name + ': ' + e.message); }
+    }
+  } else {
+    // fallback: match checked names to fallbackFileArray (by name or webkitRelativePath)
+    for (const c of checks){
+      const label = c.nextSibling.textContent;
+      const f = fallbackFileArray.find(x => x.name === label || x.webkitRelativePath === label);
+      if (!f) { log('⚠️ file tidak ditemukan: ' + label); continue; }
+      try {
+        log('🔒 Encrypt fallback: ' + label);
+        const blobEnc = await encryptBuffer(f.name, f.type, await f.arrayBuffer(), pin);
+        downloadBlob(blobEnc, (f.name || 'file') + '.enc');
+        log('✅ Diunduh: ' + f.name + '.enc');
+      } catch(e){ log('❌ Error fallback encrypt ' + label + ': ' + e.message); }
+    }
+  }
+  log('Selesai enkripsi.');
+});
+
+/* Decrypt selected .enc (dir or fallback) */
+document.getElementById('decryptBtn').addEventListener('click', async ()=>{
+  const pin = document.getElementById('pin').value || '';
+  const checks = Array.from(fileListEl.querySelectorAll('input[type=checkbox]:checked'));
+  if (checks.length===0) { alert('Centang file .enc untuk didekripsi'); return; }
+  if (dirHandle){
+    for (const c of checks){
+      const name = c.dataset.name;
+      if (!name.endsWith('.enc')) { log('Lewati (bukan .enc): ' + name); continue; }
+      try {
+        log('🔓 Membaca: ' + name);
+        const fh = await dirHandle.getFileHandle(name);
+        const blob = await fh.getFile();
+        const outFile = await decryptBlobToFile(blob, pin);
+        try {
+          const outHandle = await dirHandle.getFileHandle(outFile.name, {create:true});
+          const w = await outHandle.createWritable();
+          await w.write(await outFile.arrayBuffer());
+          await w.close();
+          log('✅ Ditulis hasil dekripsi: ' + outFile.name);
+        } catch(e){
+          downloadBlob(outFile, outFile.name);
+          log('ℹ Hasil dekripsi diunduh: ' + outFile.name);
+        }
+      } catch(e){ log('❌ Error decrypt ' + name + ': ' + e.message); }
+    }
+  } else {
+    for (const c of checks){
+      const label = c.nextSibling.textContent;
+      const f = fallbackFileArray.find(x => x.name === label || x.webkitRelativePath === label);
+      if (!f) { log('⚠️ file tidak ditemukan: ' + label); continue; }
+      if (!f.name.endsWith('.enc')) { log('Lewati (bukan .enc): ' + f.name); continue; }
+      try {
+        log('🔓 Decrypt fallback: ' + f.name);
+        const out = await decryptBlobToFile(f, pin);
+        downloadBlob(out, out.name);
+        log('✅ Hasil dekripsi diunduh: ' + out.name);
+      } catch(e){ log('❌ Error fallback decrypt ' + f.name + ': ' + e.message); }
+    }
+  }
+});
+
+/* Refresh (re-list) */
+document.getElementById('refreshBtn').addEventListener('click', async ()=> {
+  if (dirHandle) await listDir();
+  else log('Tidak ada folder dirHandle untuk di-refresh');
+});
+
+/* Fallback buttons (manual file input) */
+document.getElementById('encryptFallback').addEventListener('click', async ()=>{
+  const inp = document.getElementById('fileInput');
+  const pin = document.getElementById('pin').value || '';
+  if (!inp.files || inp.files.length===0){ alert('Pilih file dulu'); return; }
+  for (const f of inp.files){
+    try {
+      log('🔒 Encrypt (manual): ' + f.name);
+      const blobEnc = await encryptBuffer(f.name, f.type, await f.arrayBuffer(), pin);
+      downloadBlob(blobEnc, f.name + '.enc');
+      log('✅ Diunduh: ' + f.name + '.enc');
+    } catch(e){ log('❌ ' + e.message); }
+  }
+});
+document.getElementById('decryptFallback').addEventListener('click', async ()=>{
+  const inp = document.getElementById('fileInput');
+  const pin = document.getElementById('pin').value || '';
+  if (!inp.files || inp.files.length===0){ alert('Pilih file .enc dulu'); return; }
+  for (const f of inp.files){
+    try {
+      log('🔓 Decrypt (manual): ' + f.name);
+      const out = await decryptBlobToFile(f, pin);
+      downloadBlob(out, out.name);
+      log('✅ Hasil dekripsi diunduh: ' + out.name);
+    } catch(e){ log('❌ ' + e.message); }
+  }
+});
+
+/* On load: hint about secure context */
+if (!location.protocol.startsWith('http')) log('⚠️ Halaman dibuka lewat file:// — beberapa fitur mungkin tidak berfungsi. Jalankan server lokal (python -m http.server) atau buka via https/localhost.');
+</script>
+</body>
+  </html>
